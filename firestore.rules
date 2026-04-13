@@ -1,0 +1,148 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: userId (auth.uid)
+    // Fields:
+    //   - username: string (required, 3-30 chars)
+    //   - bio: string (optional, max 200 chars)
+    //   - email: string (required, email format)
+    //   - photoURL: string (optional, URL format)
+    //   - createdAt: timestamp (required)
+    //
+    // Collection: posts
+    // Document ID: postId (auto-generated)
+    // Fields:
+    //   - title: string (required, 1-100 chars)
+    //   - content: string (required, 1-5000 chars)
+    //   - language: string (required, enum: Hindi, Urdu, English, Others)
+    //   - authorId: string (required, immutable)
+    //   - authorName: string (required)
+    //   - likesCount: number (required, default 0)
+    //   - createdAt: timestamp (required, immutable)
+    //
+    // Collection: posts/{postId}/likes
+    // Document ID: userId (auth.uid)
+    // Fields:
+    //   - userId: string (required)
+    //   - postId: string (required)
+    //   - createdAt: timestamp (required)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidUrl(url) {
+      return url is string && (url.matches("^https://.*") || url.matches("^http://.*"));
+    }
+
+    function isRecent(ts) {
+      return ts > request.time - duration.value(5, 'm') && ts <= request.time;
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['username', 'email', 'createdAt']) &&
+             data.username is string && data.username.size() >= 3 && data.username.size() <= 30 &&
+             isValidEmail(data.email) &&
+             data.createdAt is timestamp &&
+             (!('bio' in data) || (data.bio is string && data.bio.size() <= 200)) &&
+             (!('photoURL' in data) || isValidUrl(data.photoURL));
+    }
+
+    function isValidPost(data) {
+      return data.keys().hasAll(['title', 'content', 'language', 'authorId', 'authorName', 'likesCount', 'createdAt']) &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 100 &&
+             data.content is string && data.content.size() >= 1 && data.content.size() <= 5000 &&
+             data.language in ['Hindi', 'Urdu', 'English', 'Others'] &&
+             data.authorId is string &&
+             data.authorName is string &&
+             data.likesCount is number &&
+             data.createdAt is timestamp;
+    }
+
+    function isValidLike(data) {
+      return data.keys().hasAll(['userId', 'postId', 'createdAt']) &&
+             data.userId == request.auth.uid &&
+             data.createdAt is timestamp;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isOwner(userId) && isValidUser(request.resource.data) && isRecent(request.resource.data.createdAt);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data) && 
+                    request.resource.data.createdAt == resource.data.createdAt &&
+                    request.resource.data.email == resource.data.email;
+    }
+
+    match /posts/{postId} {
+      allow read: if true; // Publicly readable
+      allow create: if isAuthenticated() && 
+                    isValidPost(request.resource.data) && 
+                    request.resource.data.authorId == request.auth.uid &&
+                    request.resource.data.likesCount == 0 &&
+                    isRecent(request.resource.data.createdAt);
+      
+      allow update: if isAuthenticated() && (
+        // Author can update content/title
+        (resource.data.authorId == request.auth.uid && 
+         isValidPost(request.resource.data) &&
+         request.resource.data.authorId == resource.data.authorId &&
+         request.resource.data.createdAt == resource.data.createdAt &&
+         request.resource.data.likesCount == resource.data.likesCount) ||
+        
+        // Anyone can update likesCount via atomic increment
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likesCount']) &&
+         math.abs(request.resource.data.likesCount - resource.data.likesCount) == 1 &&
+         (
+           // Increment
+           (request.resource.data.likesCount > resource.data.likesCount &&
+            !exists(/databases/$(database)/documents/posts/$(postId)/likes/$(request.auth.uid)) &&
+            getAfter(/databases/$(database)/documents/posts/$(postId)/likes/$(request.auth.uid)) != null) ||
+           // Decrement
+           (request.resource.data.likesCount < resource.data.likesCount &&
+            exists(/databases/$(database)/documents/posts/$(postId)/likes/$(request.auth.uid)) &&
+            getAfter(/databases/$(database)/documents/posts/$(postId)/likes/$(request.auth.uid)) == null)
+         ))
+      );
+      
+      allow delete: if isAuthenticated() && resource.data.authorId == request.auth.uid;
+
+      match /likes/{userId} {
+        allow read: if true;
+        allow create: if isOwner(userId) && isValidLike(request.resource.data) && isRecent(request.resource.data.createdAt);
+        allow delete: if isOwner(userId);
+      }
+    }
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
